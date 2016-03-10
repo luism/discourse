@@ -24,20 +24,115 @@ describe PostAlerter do
     end
   end
 
-  context 'likes' do
-    it 'does not double notify users on likes' do
+  context 'edits' do
+    it 'notifies correctly on edits' do
+
       ActiveRecord::Base.observers.enable :all
 
       post = Fabricate(:post, raw: 'I love waffles')
-      PostAction.act(evil_trout, post, PostActionType.types[:like])
 
       admin = Fabricate(:admin)
       post.revise(admin, {raw: 'I made a revision'})
 
+      # skip this notification cause we already notified on a similar edit
+      Timecop.freeze(2.hours.from_now) do
+        post.revise(admin, {raw: 'I made another revision'})
+      end
+
+      post.revise(Fabricate(:admin), {raw: 'I made a revision'})
+
+      Timecop.freeze(4.hours.from_now) do
+        post.revise(admin, {raw: 'I made another revision'})
+      end
+
+      expect(Notification.count(post_number: 1, topic_id: post.topic_id)).to eq(3)
+    end
+  end
+
+  context 'likes' do
+
+    it 'notifies on likes after an undo' do
+      ActiveRecord::Base.observers.enable :all
+
+      post = Fabricate(:post, raw: 'I love waffles')
+
+      PostAction.act(evil_trout, post, PostActionType.types[:like])
+      PostAction.remove_act(evil_trout, post, PostActionType.types[:like])
+      PostAction.act(evil_trout, post, PostActionType.types[:like])
+
+      expect(Notification.count(post_number: 1, topic_id: post.topic_id)).to eq(1)
+    end
+
+    it 'notifies on does not notify when never is selected' do
+      ActiveRecord::Base.observers.enable :all
+
+      post = Fabricate(:post, raw: 'I love waffles')
+
+      post.user.user_option.update_columns(like_notification_frequency:
+                                           UserOption.like_notification_frequency_type[:never])
+
+      PostAction.act(evil_trout, post, PostActionType.types[:like])
+
+
+      expect(Notification.count(post_number: 1, topic_id: post.topic_id)).to eq(0)
+    end
+
+    it 'notifies on likes correctly' do
+      ActiveRecord::Base.observers.enable :all
+
+      post = Fabricate(:post, raw: 'I love waffles')
+
+      PostAction.act(evil_trout, post, PostActionType.types[:like])
+      admin = Fabricate(:admin)
       PostAction.act(admin, post, PostActionType.types[:like])
 
-      # one like and one edit notification
+      # one like
+      expect(Notification.count(post_number: 1, topic_id: post.topic_id)).to eq(1)
+
+
+      post.user.user_option.update_columns(like_notification_frequency:
+                                           UserOption.like_notification_frequency_type[:always])
+
+      admin2 = Fabricate(:admin)
+      PostAction.act(admin2, post, PostActionType.types[:like])
+      expect(Notification.count(post_number: 1, topic_id: post.topic_id)).to eq(1)
+
+      # adds info to the notification
+      notification = Notification.find_by(post_number: 1,
+                                          topic_id: post.topic_id)
+
+
+      expect(notification.data_hash["count"].to_i).to eq(2)
+      expect(notification.data_hash["username2"]).to eq(evil_trout.username)
+
+      # this is a tricky thing ... removing a like should fix up the notifications
+      PostAction.remove_act(evil_trout, post, PostActionType.types[:like])
+
+      # rebuilds the missing notification
+      expect(Notification.count(post_number: 1, topic_id: post.topic_id)).to eq(1)
+      notification = Notification.find_by(post_number: 1,
+                                          topic_id: post.topic_id)
+
+      expect(notification.data_hash["count"]).to eq(2)
+      expect(notification.data_hash["username"]).to eq(admin2.username)
+      expect(notification.data_hash["username2"]).to eq(admin.username)
+
+
+      post.user.user_option.update_columns(like_notification_frequency:
+                                           UserOption.like_notification_frequency_type[:first_time_and_daily])
+
+      # this gets skipped
+      admin3 = Fabricate(:admin)
+      PostAction.act(admin3, post, PostActionType.types[:like])
+
+      Timecop.freeze(2.days.from_now) do
+        admin4 = Fabricate(:admin)
+        PostAction.act(admin4, post, PostActionType.types[:like])
+      end
+
+      # first happend within the same day, no need to notify
       expect(Notification.count(post_number: 1, topic_id: post.topic_id)).to eq(2)
+
     end
   end
 
@@ -156,6 +251,15 @@ describe PostAlerter do
       }.not_to change(user.notifications, :count)
     end
 
+  it "notification comes from editor is mention is added later" do
+      admin = Fabricate(:admin)
+      post = create_post_with_alerts(user: user, raw: 'No mention here.')
+      expect {
+        post.revise(admin, { raw: "Mention @eviltrout in this edit." })
+      }.to change(evil_trout.notifications, :count)
+      n = evil_trout.notifications.last
+      expect(n.data_hash["original_username"]).to eq(admin.username)
+    end
   end
 
   describe ".create_notification" do
